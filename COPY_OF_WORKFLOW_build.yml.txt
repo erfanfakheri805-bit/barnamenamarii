@@ -1,0 +1,268 @@
+name: Build signed APK + AAB
+
+# هیچ تنظیم دستی لازم نیست: فایل‌ها را آپلود کنید (push)، منتظر بمانید، APK را از Releases بردارید.
+# امضا: اگر Secret‌های KEYSTORE_* تنظیم باشند از آن‌ها، وگرنه از signing/invisibility-release.keystore.
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: "کش بیلد را نادیده بگیر (بیلد کامل از صفر)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write            # لازم برای انتشار APK در بخش Releases
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LC_ALL: C.UTF-8
+  LANG: C.UTF-8
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf automake libtool pkg-config build-essential ccache cmake \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev libltdl-dev
+
+      - name: Install Python tooling
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv fonttools
+
+      - name: Download font + MediaPipe models
+        run: python scripts/fetch_assets.py --verify-font
+
+      - name: Prepare signing key
+        env:
+          S_KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.keystore"
+          if [ -n "${S_KEYSTORE_BASE64:-}" ] && [ -n "${S_KEYSTORE_PASSWORD:-}" ] && [ -n "${S_KEY_ALIAS:-}" ]; then
+            echo "signing key: repository secrets"
+            echo "$S_KEYSTORE_BASE64" | base64 -d > "$KS"
+            ALIAS="$S_KEY_ALIAS"; SPASS="$S_KEYSTORE_PASSWORD"; KPASS="${S_KEY_PASSWORD:-$S_KEYSTORE_PASSWORD}"
+            echo "::add-mask::$SPASS"; echo "::add-mask::$KPASS"
+          elif [ -f signing/invisibility-release.keystore ]; then
+            echo "signing key: signing/invisibility-release.keystore (bundled)"
+            cp signing/invisibility-release.keystore "$KS"
+            ALIAS="invisibility"; SPASS="invisibility-ar"; KPASS="invisibility-ar"
+          else
+            echo "::warning::no keystore found - generating a temporary one (updates will need an uninstall first)"
+            keytool -J-Dkeystore.pkcs12.legacy -genkeypair -keystore "$KS" -storetype PKCS12 \
+              -alias invisibility -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass invisibility-ar -keypass invisibility-ar \
+              -dname "CN=Invisibility AR, OU=App, O=InvisibilityAR, L=Tehran, ST=Tehran, C=IR"
+            ALIAS="invisibility"; SPASS="invisibility-ar"; KPASS="invisibility-ar"
+          fi
+          {
+            echo "KS=$KS"
+            echo "KS_PASS=$SPASS"
+            echo "KEY_PASS=$KPASS"
+            echo "KEY_ALIAS=$ALIAS"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache key
+        id: cachekey
+        run: echo "key=buildozer-$(sha256sum buildozer.spec | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        if: ${{ !inputs.clean }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: ${{ steps.cachekey.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.cachekey.outputs.key }}-
+
+      - name: Set version numbers
+        run: |
+          NUM="${{ github.run_number }}"
+          sed -i '/^android.numeric_version/d' buildozer.spec
+          sed -i "/^\[app\]/a android.numeric_version = ${NUM}" buildozer.spec
+          sed -i "s/^version *=.*/version = 1.0.${NUM}/" buildozer.spec
+          grep -nE "^(version|android.numeric_version|p4a.branch) *=" buildozer.spec
+
+      - name: Build release APK and AAB (unsigned)
+        run: |
+          set -uo pipefail
+          mkdir -p unsigned
+          : > build.log
+
+          build() {    # $1 = apk | aab
+            sed -i "s/^android.release_artifact *=.*/android.release_artifact = $1/" buildozer.spec
+            buildozer -v android release 2>&1 | tee -a build.log
+            return "${PIPESTATUS[0]}"
+          }
+          try_build() {
+            local kind="$1" n
+            for n in 1 2; do
+              echo "::group::buildozer ${kind}, attempt ${n}"
+              if build "$kind"; then echo "::endgroup::"; return 0; fi
+              echo "::endgroup::"
+              echo "::warning::buildozer ${kind} attempt ${n} failed"
+            done
+            return 1
+          }
+          pick() {     # $1 = extension -> first release file in bin/
+            local f
+            for f in bin/*."$1"; do
+              case "$f" in *debug*) continue ;; esac
+              [ -f "$f" ] && { echo "$f"; return 0; }
+            done
+            return 1
+          }
+
+          if ! try_build apk; then
+            echo "::warning::falling back to python-for-android 'develop'"
+            sed -i 's/^p4a.branch *=.*/p4a.branch = develop/' buildozer.spec
+            rm -rf .buildozer/android/platform/python-for-android .buildozer/android/platform/build-*
+            try_build apk || { echo "::error::APK build failed - see the log summary below"; exit 1; }
+          fi
+          cp "$(pick apk)" unsigned/app.apk
+
+          if try_build aab && pick aab > /dev/null; then
+            cp "$(pick aab)" unsigned/app.aab
+          else
+            echo "::warning::AAB could not be built - the APK is unaffected"
+          fi
+          ls -la unsigned
+
+      - name: Sign APK and AAB
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
+          echo "build-tools: $BT"
+          mkdir -p signed
+
+          "$BT/zipalign" -p -f 4 unsigned/app.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --out signed/InvisibilityAR.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose --print-certs signed/InvisibilityAR.apk
+
+          if [ -f unsigned/app.aab ]; then
+            cp unsigned/app.aab signed/InvisibilityAR.aab
+            jarsigner -keystore "$KS" -storepass:env KS_PASS -keypass:env KEY_PASS \
+              -sigalg SHA256withRSA -digestalg SHA-256 signed/InvisibilityAR.aab "$KEY_ALIAS"
+            jarsigner -verify -certs signed/InvisibilityAR.aab | tail -n 3
+          fi
+          (cd signed && sha256sum * | tee SHA256SUMS.txt)
+          rm -f "$KS"
+
+      - name: Save build cache
+        if: ${{ always() && !inputs.clean }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: ${{ steps.cachekey.outputs.key }}-${{ github.run_id }}
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: InvisibilityAR-signed
+          path: signed/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release (direct APK download)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "نامرئی‌ساز - نسخهٔ ${{ github.run_number }}"
+          make_latest: true
+          body: |
+            ## نصب روی گوشی
+            1. فایل **InvisibilityAR.apk** را از بخش Assets (پایین همین صفحه) دانلود کنید.
+            2. فایل دانلودشده را باز کنید و اگر گوشی پرسید، «نصب از این منبع» را اجازه دهید.
+            3. در اولین اجرا مجوز **دوربین** و **میکروفون** را بدهید.
+
+            فایل `InvisibilityAR.aab` برای بارگذاری در فروشگاه‌ها است و برای نصب مستقیم لازم نیست.
+          files: |
+            signed/InvisibilityAR.apk
+            signed/InvisibilityAR.aab
+            signed/SHA256SUMS.txt
+
+      - name: Build summary
+        if: success()
+        run: |
+          {
+            echo "## ✅ ساخت موفق بود"
+            echo ""
+            echo "**APK امضاشده:** مخزن ← بخش **Releases** ← آخرین نسخه ← \`InvisibilityAR.apk\`"
+            echo ""
+            echo "(همین فایل در بخش Artifacts پایین همین صفحه هم هست.)"
+            echo ""
+            echo '```'
+            cat signed/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure details
+        if: failure()
+        run: |
+          {
+            echo "## ❌ ساخت ناموفق بود"
+            echo ""
+            echo "آخرین خطوط لاگ را کپی کنید و برای پشتیبانی بفرستید:"
+            echo '```'
+            if [ -f build.log ]; then
+              grep -nE "Traceback|Error|error:|FAILED|Exception" build.log | tail -n 25 || true
+              echo "----- last 40 lines -----"
+              tail -n 40 build.log
+            else
+              echo "(build.log وجود ندارد؛ خطا پیش از شروع بیلد رخ داده است)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7

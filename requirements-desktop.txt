@@ -1,0 +1,6 @@
+# Desktop development / tests (the Android build uses buildozer.spec instead)
+kivy>=2.3.0
+numpy
+opencv-python
+mediapipe
+fonttools
