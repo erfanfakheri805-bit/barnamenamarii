@@ -30,10 +30,10 @@ orientation = portrait
 fullscreen = 0
 
 # ---------------------------------------------------------------------------
-# permissions: دوربین، میکروفون (ضبط صدا)، ذخیره‌سازی (فقط اندروید ۹ و قدیمی‌تر لازم است)،
+# permissions: دوربین، میکروفون (ضبط صدا)، ذخیره‌سازی (فقط اندروید ۹ و قدیمی‌تر واقعاً لازم است؛ در نسخه‌های جدید نادیده گرفته می‌شود)،
 # دسترسی به ویدیوها (اندروید ۱۳+) و لرزش
 # ---------------------------------------------------------------------------
-android.permissions = CAMERA, RECORD_AUDIO, VIBRATE, (name=android.permission.WRITE_EXTERNAL_STORAGE;maxSdkVersion=28), (name=android.permission.READ_EXTERNAL_STORAGE;maxSdkVersion=32), READ_MEDIA_VIDEO
+android.permissions = CAMERA, RECORD_AUDIO, VIBRATE, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE, READ_MEDIA_VIDEO
 
 android.api = 33
 android.minapi = 24

@@ -34,6 +34,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check project files
+        run: |
+          missing=0
+          for f in main.py ar_engine.py recorder.py persian.py invisibility.kv buildozer.spec \
+                   scripts/fetch_assets.py assets/icon.png assets/presplash.png \
+                   assets/icons/fist.png assets/icons/hand.png assets/fonts/DejaVuSans.ttf; do
+            if [ ! -f "$f" ]; then
+              echo "::error::فایل ${f} در مخزن نیست؛ آپلود ناقص بوده است. همهٔ فایل‌ها (و پوشه‌ها) را دوباره آپلود کنید."
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
@@ -60,7 +73,13 @@ jobs:
       - name: Install Python tooling
         run: |
           python -m pip install --upgrade pip wheel
-          python -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv fonttools
+          python -m pip install "buildozer==1.5.0" "cython==0.29.36" "sh==1.14.3" "cmake==3.28.4" virtualenv fonttools
+          echo "python: $(python --version) | java: $(java -version 2>&1 | head -1) | cmake: $(cmake --version | head -1)"
+          python -m pip list 2>/dev/null | grep -iE "^(buildozer|cython|sh|virtualenv|cmake|pexpect) "
+
+      - name: Cache key
+        id: cachekey
+        run: echo "key=buildozer-$(sha256sum buildozer.spec | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Download font + MediaPipe models
         run: python scripts/fetch_assets.py --verify-font
@@ -98,10 +117,6 @@ jobs:
             echo "KEY_ALIAS=$ALIAS"
           } >> "$GITHUB_ENV"
 
-      - name: Cache key
-        id: cachekey
-        run: echo "key=buildozer-$(sha256sum buildozer.spec | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
       - name: Restore build cache
         if: ${{ !inputs.clean }}
         uses: actions/cache/restore@v4
@@ -122,6 +137,8 @@ jobs:
           grep -nE "^(version|android.numeric_version|p4a.branch) *=" buildozer.spec
 
       - name: Build release APK and AAB (unsigned)
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           set -uo pipefail
           mkdir -p unsigned
@@ -152,10 +169,8 @@ jobs:
           }
 
           if ! try_build apk; then
-            echo "::warning::falling back to python-for-android 'develop'"
-            sed -i 's/^p4a.branch *=.*/p4a.branch = develop/' buildozer.spec
-            rm -rf .buildozer/android/platform/python-for-android .buildozer/android/platform/build-*
-            try_build apk || { echo "::error::APK build failed - see the log summary below"; exit 1; }
+            echo "::error::APK build failed - see the log summary below"
+            exit 1
           fi
           cp "$(pick apk)" unsigned/app.apk
 
@@ -190,7 +205,7 @@ jobs:
           rm -f "$KS"
 
       - name: Save build cache
-        if: ${{ always() && !inputs.clean }}
+        if: ${{ always() && !inputs.clean && steps.cachekey.outputs.key != '' }}
         uses: actions/cache/save@v4
         with:
           path: |
